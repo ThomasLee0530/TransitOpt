@@ -4,15 +4,15 @@ import networkx as nx
 import requests
 from datetime import datetime
 
-# 1. 頁面設定
+# 1. 頁面組態設定
 st.set_page_config(page_title="HK TransitOpt - 全港路線規劃系統", page_icon="🇭🇰", layout="wide")
 
-st.title("HK TransitOpt - 全港跨交通工具最佳路線規劃器")
+st.title("🇭🇰 HK TransitOpt - 全港跨交通工具最佳路線規劃器")
 st.write("涵蓋港鐵全綫、九巴及城巴網絡，利用 **NetworkX (Dijkstra 演算法)** 自動推算最快轉乘方案。")
 
 st.divider()
 
-# 2. 建立全港交通網絡圖
+# 2. 建立全港交通網絡圖 (Graph Construction)
 @st.cache_data
 def build_full_hk_network():
     G = nx.DiGraph()
@@ -56,12 +56,11 @@ def build_full_hk_network():
         ("南昌", "柯士甸", 4, "MTR 屯馬綫", ""), ("柯士甸", "尖東", 3, "MTR 屯馬綫", ""),
         ("尖東", "紅磡", 2, "MTR 屯馬綫", ""), ("紅磡", "何文田", 3, "MTR 屯馬綫", ""),
         ("何文田", "土瓜灣", 3, "MTR 屯馬綫", ""), ("土瓜灣", "宋皇臺", 2, "MTR 屯馬綫", ""),
-        ("宋皇臺", "啟德", 2, "MTR 屯馬綫", ""), ("啟德", "鑽石山", 3, "MTR 鑽石山", ""),
+        ("宋皇臺", "啟德", 2, "MTR 屯馬綫", ""), ("啟德", "鑽石山", 3, "MTR 屯馬綫", ""),
         ("鑽石山", "大圍", 6, "MTR 屯馬綫", "")
     ]
 
-    # [資料集 2] 巴士路線 (加上 bound 去回程與方向標註)
-    # bound: outbound / inbound
+    # [資料集 2] 專營巴士路線 (包含目的地與去回程 bound)
     bus_edges_one_way = [
         ("彩虹", "香港科技大學 (HKUST)", 15, "九巴 91M", "寶林", "outbound"),
         ("鑽石山", "香港科技大學 (HKUST)", 20, "九巴 91M", "寶林", "outbound"),
@@ -83,7 +82,7 @@ def build_full_hk_network():
         
     return G
 
-# 3. 路徑壓縮
+# 3. 路徑壓縮演算法 (省略中間站，只留上/落車站)
 def compress_path(G, path):
     if len(path) < 2:
         return []
@@ -137,76 +136,84 @@ def compress_path(G, path):
     
     return compressed_steps
 
-# 4. 九巴特定車站 ETA 查詢函數 (解決抓取起點站時間問題)
-@st.cache_data(ttl=3600)
-def get_kmb_stop_id(route_no, bound, station_name):
-    """
-    從九巴 API 取得特定路線在特定車站的 stop_id
-    """
-    url = f"https://data.etabus.gov.hk/v1/transport/kmb/route-stop/{route_no}/{bound}/1"
-    try:
-        res = requests.get(url, timeout=3).json()
-        stops_data = res.get("data", [])
-        
-        # 獲取全港車站名稱表進行比對
-        stops_list_url = "https://data.etabus.gov.hk/v1/transport/kmb/stop"
-        stops_res = requests.get(stops_list_url, timeout=3).json().get("data", [])
-        stop_name_map = {s["stop"]: s["name_tc"] for s in stops_res}
-        
-        for item in stops_data:
-            s_id = item.get("stop")
-            s_name = stop_name_map.get(s_id, "")
-            if station_name in s_name:
-                return s_id
-    except Exception:
-        pass
-    return None
+# 4. 九巴特定車站 ETA 抓取函數 (解決全綫總站問題)
+KNOWN_STOP_IDS = {
+    ("91M", "彩虹"): "D39908FCA8454DFF",  # 彩虹站 / 碧海樓 / 坪石
+    ("91M", "鑽石山"): "2C208453412E8B92"
+}
 
-def fetch_exact_stop_eta(route_no, station_name, target_dest, bound):
+def fetch_exact_stop_eta(route_no, station_name, target_dest):
     """
-    準確抓取「指定上車站」的到站時間
+    透過 stop-eta API 或精確按時間過濾，抓取指定上車站的班次
     """
-    api_url = f"https://data.etabus.gov.hk/v1/transport/kmb/route-eta/{route_no}/1"
-    try:
-        res = requests.get(api_url, timeout=3)
-        if res.status_code == 200:
-            data = res.json().get("data", [])
-            if data:
-                now = datetime.now()
-                eta_rows = []
+    now = datetime.now()
+    eta_rows = []
+    
+    stop_id = KNOWN_STOP_IDS.get((route_no, station_name))
+    
+    if stop_id:
+        api_url = f"https://data.etabus.gov.hk/v1/transport/kmb/stop-eta/{stop_id}"
+        try:
+            res = requests.get(api_url, timeout=3)
+            if res.status_code == 200:
+                data = res.json().get("data", [])
+                for item in data:
+                    if item.get("route") == route_no and (not target_dest or target_dest in item.get("dest_tc", "")):
+                        eta_str = item.get("eta")
+                        if eta_str:
+                            eta_t = datetime.fromisoformat(eta_str)
+                            diff = int((eta_t - now.astimezone()).total_seconds() / 60)
+                            if diff >= 0:
+                                eta_rows.append({
+                                    "上車地點": station_name,
+                                    "目的地": item.get("dest_tc"),
+                                    "預計到達上車站時間": eta_t.strftime("%H:%M:%S"),
+                                    "到站倒數": f"{diff} 分鐘" if diff > 0 else "即將到站",
+                                    "raw_time": eta_t
+                                })
+        except Exception:
+            pass
+            
+    # 若無專用 Stop ID，採用去重過濾法
+    if not eta_rows:
+        api_url = f"https://data.etabus.gov.hk/v1/transport/kmb/route-eta/{route_no}/1"
+        try:
+            res = requests.get(api_url, timeout=3)
+            if res.status_code == 200:
+                data = res.json().get("data", [])
+                seen_times = set()
                 
-                # 比對目的地與方向，並過濾出上車站資料
-                filtered = [d for d in data if target_dest in d.get("dest_tc", "")] if target_dest else data
-                
-                for item in filtered:
+                for item in data:
+                    dest = item.get("dest_tc", "")
                     eta_str = item.get("eta")
-                    remark = item.get("rmk_tc", "")
-                    if eta_str:
+                    
+                    if target_dest in dest and eta_str:
                         eta_t = datetime.fromisoformat(eta_str)
+                        time_key = eta_t.strftime("%H:%M")
                         diff = int((eta_t - now.astimezone()).total_seconds() / 60)
                         
-                        # 排除已經過去的時間
-                        if diff >= 0:
-                            countdown = f"{diff} 分鐘" if diff > 0 else "即將到站"
+                        if diff >= 0 and time_key not in seen_times:
+                            seen_times.add(time_key)
                             eta_rows.append({
                                 "上車地點": station_name,
-                                "目的地": item.get("dest_tc"),
+                                "目的地": dest,
                                 "預計到達上車站時間": eta_t.strftime("%H:%M:%S"),
-                                "到站倒數": countdown,
-                                "備註": remark
+                                "到站倒數": f"{diff} 分鐘" if diff > 0 else "即將到站",
+                                "raw_time": eta_t
                             })
-                
-                # 排序並取出最近 3 班車
-                eta_rows = sorted(eta_rows, key=lambda x: x["預計到達上車站時間"])[:3]
-                return eta_rows
-    except Exception:
-        pass
-    return []
+        except Exception:
+            pass
 
+    eta_rows = sorted(eta_rows, key=lambda x: x["raw_time"])[:3]
+    for r in eta_rows:
+        r.pop("raw_time", None)
+        
+    return eta_rows
+
+# 5. 主程式與 Streamlit 介面
 G = build_full_hk_network()
 all_stations = sorted(list(G.nodes()))
 
-# 5. UI 介面
 col1, col2 = st.columns(2)
 with col1:
     start_node = st.selectbox("📍 出發車站 / 地點:", options=all_stations, index=all_stations.index("屯門") if "屯門" in all_stations else 0)
@@ -247,23 +254,21 @@ if st.button("🗺️ 計算全港最佳路線", type="primary"):
                     bus_checks.append({
                         "route": bus_no, 
                         "board": board, 
-                        "target_dest": step["方向"],
-                        "bound": step["bound"]
+                        "target_dest": step["方向"]
                     })
                     
-            # 6. 精準顯示「上車站」實時倒數
+            # 6. 顯示精準上車站到站倒數
             if bus_checks:
                 st.subheader("⏱️ 轉乘點九巴實時班次 (Live Boarding Stop ETA)")
                 for item in bus_checks:
                     r_no = item["route"]
                     board_station = item["board"]
                     target_dest = item["target_dest"]
-                    bound = item["bound"]
                     
-                    eta_data = fetch_exact_stop_eta(r_no, board_station, target_dest, bound)
+                    eta_data = fetch_exact_stop_eta(r_no, board_station, target_dest)
                     
                     if eta_data:
-                        st.write(f"🚍 **九巴 {r_no}**（在 **`{board_station}`** 上車，往 `{target_dest}` 方向）到站倒數：")
+                        st.write(f"🚍 **九巴 {r_no}**（在 **`{board_station}`** 上車，往 `{target_dest}` 方向）即時班次：")
                         st.dataframe(pd.DataFrame(eta_data), use_container_width=True)
                     else:
                         st.caption(f"暫時無法取得 九巴 {r_no} 在 {board_station} 的實時到站數據。")
