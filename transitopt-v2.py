@@ -7,12 +7,12 @@ from datetime import datetime
 # 1. 頁面組態設定
 st.set_page_config(page_title="HK TransitOpt - 全港路線規劃系統", page_icon="🇭🇰", layout="wide")
 
-st.title("HK TransitOpt - 全港跨交通工具最佳路線規劃器")
+st.title("🇭🇰 HK TransitOpt - 全港跨交通工具最佳路線規劃器")
 st.write("涵蓋港鐵全綫、九巴及城巴網絡，利用 **NetworkX (Dijkstra 演算法)** 自動推算最快轉乘方案。")
 
 st.divider()
 
-# 2. 建立全港交通網絡圖
+# 2. 建立全港交通網絡圖 (包含完整港島綫與 HKU 站)
 @st.cache_data
 def build_full_hk_network():
     G = nx.DiGraph()
@@ -57,11 +57,20 @@ def build_full_hk_network():
         ("尖東", "紅磡", 2, "MTR 屯馬綫", ""), ("紅磡", "何文田", 3, "MTR 屯馬綫", ""),
         ("何文田", "土瓜灣", 3, "MTR 屯馬綫", ""), ("土瓜灣", "宋皇臺", 2, "MTR 屯馬綫", ""),
         ("宋皇臺", "啟德", 2, "MTR 屯馬綫", ""), ("啟德", "鑽石山", 3, "MTR 屯馬綫", ""),
-        ("鑽石山", "大圍", 6, "MTR 屯馬綫", "")
+        ("鑽石山", "大圍", 6, "MTR 屯馬綫", ""),
+
+        # 港島綫 (完整補充，包含香港大學 HKU)
+        ("堅尼地城", "香港大學 (HKU)", 2, "MTR 港島綫", ""), ("香港大學 (HKU)", "西營盤", 2, "MTR 港島綫", ""),
+        ("西營盤", "上環", 2, "MTR 港島綫", ""), ("上環", "中環", 2, "MTR 港島綫", ""),
+        ("中環", "金鐘", 2, "MTR 港島綫", ""), ("金鐘", "灣仔", 2, "MTR 港島綫", ""),
+        ("灣仔", "銅鑼灣", 2, "MTR 港島綫", ""), ("銅鑼灣", "天后", 2, "MTR 港島綫", ""),
+        ("天后", "炮台山", 2, "MTR 港島綫", ""), ("炮台山", "北角", 2, "MTR 港島綫", ""),
+        ("北角", "鰂魚涌", 2, "MTR 港島綫", ""), ("鰂魚涌", "太古", 2, "MTR 港島綫", ""),
+        ("太古", "西灣河", 2, "MTR 港島綫", ""), ("西灣河", "筲箕灣", 2, "MTR 港島綫", ""),
+        ("筲箕灣", "柴灣", 3, "MTR 港島綫", "")
     ]
 
-    # [資料集 2] 專營巴士路線 (加上上車站的 seq 序號對照)
-    # 九巴 91M 往寶林方向，鑽石山總站 seq:1, 彩虹碧海樓 seq:3
+    # [資料集 2] 專營巴士路線
     bus_edges_one_way = [
         ("彩虹", "香港科技大學 (HKUST)", 15, "九巴 91M", "寶林", "outbound", 3),
         ("鑽石山", "香港科技大學 (HKUST)", 20, "九巴 91M", "寶林", "outbound", 1),
@@ -76,7 +85,7 @@ def build_full_hk_network():
 
     for u, v, weight, line, dest in mtr_edges:
         G.add_edge(u, v, weight=weight, line=line, dest=dest, seq=0)
-        G.add_edge(v, u, weight=weight, line=line, dest=dest, seq=0)
+        G.add_edge(v, u, weight=weight, line=line, dest=dest, dest_back=dest, seq=0)
         
     for u, v, weight, line, dest, bound, seq in bus_edges_one_way:
         G.add_edge(u, v, weight=weight, line=line, dest=dest, seq=seq)
@@ -137,11 +146,8 @@ def compress_path(G, path):
     
     return compressed_steps
 
-# 4. 精準單一車站 (seq) 到站時間抓取函數
+# 4. 九巴特定車站 (seq) 到站時間抓取函數
 def fetch_exact_stop_eta(route_no, station_name, target_dest, seq_no):
-    """
-    精準透過 seq 序號過濾，只取該特定車站（如彩虹站 seq=3）的實時到站時間
-    """
     now = datetime.now()
     eta_rows = []
     
@@ -156,7 +162,6 @@ def fetch_exact_stop_eta(route_no, station_name, target_dest, seq_no):
                 item_seq = item.get("seq")
                 eta_str = item.get("eta")
                 
-                # 關鍵核心修正：只有當目的地匹配 AND 站點序號(seq)完全相等時，才是彩虹站的時間！
                 if target_dest in dest and (seq_no == 0 or item_seq == seq_no) and eta_str:
                     eta_t = datetime.fromisoformat(eta_str)
                     diff = int((eta_t - now.astimezone()).total_seconds() / 60)
@@ -172,14 +177,13 @@ def fetch_exact_stop_eta(route_no, station_name, target_dest, seq_no):
     except Exception:
         pass
 
-    # 按車次時間排序，取未來最新的 3 班車
     eta_rows = sorted(eta_rows, key=lambda x: x["raw_time"])[:3]
     for r in eta_rows:
         r.pop("raw_time", None)
         
     return eta_rows
 
-# 5. 主程式與 Streamlit 介面
+# 5. 主程式 UI
 G = build_full_hk_network()
 all_stations = sorted(list(G.nodes()))
 
@@ -187,7 +191,7 @@ col1, col2 = st.columns(2)
 with col1:
     start_node = st.selectbox("📍 出發車站 / 地點:", options=all_stations, index=all_stations.index("屯門") if "屯門" in all_stations else 0)
 with col2:
-    end_node = st.selectbox("🎯 目的地車站 / 校園:", options=all_stations, index=all_stations.index("香港科技大學 (HKUST)") if "香港科技大學 (HKUST)" in all_stations else 1)
+    end_node = st.selectbox("🎯 目的地車站 / 校園:", options=all_stations, index=all_stations.index("香港大學 (HKU)") if "香港大學 (HKU)" in all_stations else 1)
 
 if st.button("🗺️ 計算全港最佳路線", type="primary"):
     if start_node == end_node:
@@ -227,7 +231,6 @@ if st.button("🗺️ 計算全港最佳路線", type="primary"):
                         "seq": step["seq"]
                     })
                     
-            # 6. 顯示精準上車站到站倒數
             if bus_checks:
                 st.subheader("⏱️ 轉乘點九巴實時班次 (Live Boarding Stop ETA)")
                 for item in bus_checks:
@@ -239,7 +242,7 @@ if st.button("🗺️ 計算全港最佳路線", type="primary"):
                     eta_data = fetch_exact_stop_eta(r_no, board_station, target_dest, seq)
                     
                     if eta_data:
-                        st.write(f"機能測試成功！🚍 **九巴 {r_no}**（在 **`{board_station}`** 站點上車，往 `{target_dest}` 方向）即時班次：")
+                        st.write(f"🚍 **九巴 {r_no}**（在 **`{board_station}`** 站點上車，往 `{target_dest}` 方向）即時班次：")
                         st.dataframe(pd.DataFrame(eta_data), use_container_width=True)
                     else:
                         st.caption(f"暫時無法取得 九巴 {r_no} 在 {board_station} 的實時到站數據。")
