@@ -56,7 +56,7 @@ def build_full_hk_network():
         ("南昌", "柯士甸", 4, "MTR 屯馬綫", ""), ("柯士甸", "尖東", 3, "MTR 屯馬綫", ""),
         ("尖東", "紅磡", 2, "MTR 屯馬綫", ""), ("紅磡", "何文田", 3, "MTR 屯馬綫", ""),
         ("何文田", "土瓜灣", 3, "MTR 屯馬綫", ""), ("土瓜灣", "宋皇臺", 2, "MTR 屯馬綫", ""),
-        ("宋皇臺", "啟德", 2, "MTR 觀塘綫", ""), ("啟德", "鑽石山", 3, "MTR 屯馬綫", ""),
+        ("宋皇臺", "啟德", 2, "MTR 屯馬綫", ""), ("啟德", "鑽石山", 3, "MTR 屯馬綫", ""),
         ("鑽石山", "大圍", 6, "MTR 屯馬綫", ""),
 
         # 港島綫
@@ -198,10 +198,9 @@ if st.button("🗺️ 計算全港最佳路線", type="primary"):
             raw_path = nx.dijkstra_path(G, source=start_node, target=end_node, weight='weight')
             compressed_steps = compress_path(G, raw_path)
             
-            # 動態計算時間（純車程 + 轉乘/候車時間）
+            # 動態計算總時間（純車程 + 轉乘/候車時間）
             total_in_vehicle_time = 0
             total_waiting_time = 0
-            time_breakdown = []
 
             for idx, step in enumerate(compressed_steps):
                 line = step["路線"]
@@ -211,31 +210,24 @@ if st.button("🗺️ 計算全港最佳路線", type="primary"):
                 
                 step_wait_time = 0
                 
-                # 若為轉乘步（非第一步），預設加上 MTR/路面轉乘步行與候車時間 (4 分鐘)
+                # 轉乘步驟預設 +4 分鐘步行與等候時間
                 if idx > 0:
                     step_wait_time += 4
                 
-                # 如果是巴士線，試圖讀取即時 ETA 倒數時間
+                # 若為九巴，讀取實時到站倒數時間
                 if "九巴" in line:
                     bus_no = line.split(" ")[1]
                     eta_list = fetch_exact_stop_eta(bus_no, board, step["方向"], step["seq"])
                     if eta_list:
-                        # 抓第一班車的即時倒數分鐘數作為候車時間
                         first_bus_wait = eta_list[0]["到站倒數"]
                         step_wait_time = first_bus_wait
                         step["eta_data"] = eta_list
 
                 total_waiting_time += step_wait_time
-                time_breakdown.append({
-                    "step": idx + 1,
-                    "line": line,
-                    "pure_time": pure_time,
-                    "wait_time": step_wait_time
-                })
 
             grand_total_time = total_in_vehicle_time + total_waiting_time
 
-            # 顯示結果總結
+            # 顯示門到門總預計時間
             st.success(f"🎉 **預估門到門總時間：約 {grand_total_time} 分鐘** （行車時間：{total_in_vehicle_time} 分鐘 + 候車/轉乘時間：{total_waiting_time} 分鐘）")
             
             st.subheader("🧭 轉乘路線明細：")
@@ -253,11 +245,12 @@ if st.button("🗺️ 計算全港最佳路線", type="primary"):
                 * 🔴 **落車站**：`{alight}` （行車時間：約 {pure_time} 分鐘）
                 """)
                 
-                # 顯示該站實時 ETA 表格
+                # 安全繪製實時 ETA 表格（使用 drop 避免 KeyError / TypeError）
                 if "eta_data" in step and step["eta_data"]:
                     df_display = pd.DataFrame(step["eta_data"])
                     df_display["到站倒數"] = df_display["到站倒數"].apply(lambda x: f"{x} 分鐘" if x > 0 else "即將到站")
-                    df_display.pop("raw_time", None)
+                    df_display = df_display.drop(columns=["raw_time"], errors="ignore")
+                    
                     st.write(f"⏱️ **`{board}` 站實時到站班次：**")
                     st.dataframe(df_display, use_container_width=True)
                     
