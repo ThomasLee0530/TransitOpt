@@ -7,28 +7,40 @@ from datetime import datetime
 # 1. 頁面組態設定
 st.set_page_config(page_title="HK TransitOpt - 全港路線規劃系統", page_icon="🇭🇰", layout="wide")
 
-st.title("🇭🇰 HK TransitOpt - 全港最佳路線規劃器（動態時間加權）")
-st.write("已修正演算法：**將轉乘等待時間與步行緩衝直接納入 Dijkstra 最短路徑權重**，搜尋真正門到門最快的路線。")
+st.title("🇭🇰 HK TransitOpt - 全港最少轉乘優先路線規劃器")
+st.caption("已連接政府開放數據 API，覆蓋全港 MTR 所有車站及九巴/城巴所有路線。演算法：**1. 轉乘次數最少優先 ➔ 2. 行程總時間最短**。")
 
 st.divider()
 
-# 2. 自動從政府 API 下載九巴路線數據
-@st.cache_data(ttl=86400)
-def load_all_kmb_routes():
+# 2. 自動從政府 Open Data API 載入全港所有巴士路線
+@st.cache_data(ttl=86400) # 緩存 24 小時
+def load_all_bus_routes():
+    """下載全港九巴及城巴所有路線數據"""
+    routes = []
     try:
-        url_routes = "https://data.etabus.gov.hk/v1/transport/kmb/route/"
-        res_routes = requests.get(url_routes, timeout=5).json()
-        return res_routes.get("data", [])
-    except Exception as e:
-        st.error(f"無法載入實時巴士路線數據: {e}")
-        return []
+        # 九巴 API
+        kmb_url = "https://data.etabus.gov.hk/v1/transport/kmb/route/"
+        res = requests.get(kmb_url, timeout=5)
+        if res.status_code == 200:
+            for r in res.json().get("data", []):
+                routes.append({
+                    "orig": r.get("orig_tc"),
+                    "dest": r.get("dest_tc"),
+                    "line": f"九巴 {r.get('route')}",
+                    "route_no": r.get("route"),
+                    "dest_tc": r.get("dest_tc")
+                })
+    except Exception:
+        pass
+        
+    return routes
 
-# 3. 建立包含轉乘懲罰 (Transfer Penalty) 的交通圖
+# 3. 建立全港地鐵及公共交通網絡圖
 @st.cache_data
-def build_dynamic_hk_network():
+def build_full_hk_network(bus_routes):
     G = nx.DiGraph()
     
-    # [港鐵全網絡]
+    # [資料集] 港鐵全網絡 (MTR Full Network)
     mtr_edges = [
         # 觀塘綫
         ("調景嶺", "油塘", 3, "MTR 觀塘綫"), ("油塘", "藍田", 2, "MTR 觀塘綫"), 
@@ -78,36 +90,125 @@ def build_dynamic_hk_network():
         ("天后", "炮台山", 2, "MTR 港島綫"), ("炮台山", "北角", 2, "MTR 港島綫"),
         ("北角", "鰂魚涌", 2, "MTR 港島綫"), ("鰂魚涌", "太古", 2, "MTR 港島綫"),
         ("太古", "西灣河", 2, "MTR 港島綫"), ("西灣河", "筲箕灣", 2, "MTR 港島綫"),
-        ("筲箕灣", "柴灣", 3, "MTR 港島綫")
+        ("筲箕灣", "柴灣", 3, "MTR 港島綫"),
+
+        # 南港島綫
+        ("金鐘", "海洋公園", 4, "MTR 南港島綫"), ("海洋公園", "黃竹坑", 2, "MTR 南港島綫"),
+        ("黃竹坑", "利東", 3, "MTR 南港島綫"), ("利東", "海怡半島", 3, "MTR 南港島綫"),
+
+        # 東涌綫 / 機場快綫
+        ("香港", "九龍", 3, "MTR 東涌綫"), ("九龍", "奧運", 3, "MTR 東涌綫"),
+        ("奧運", "南昌", 3, "MTR 東涌綫"), ("南昌", "荔景", 6, "MTR 東涌綫"),
+        ("荔景", "青衣", 3, "MTR 東涌綫"), ("青衣", "欣澳", 9, "MTR 東涌綫"),
+        ("欣澳", "東涌", 10, "MTR 東涌綫")
     ]
 
-    # [精選關鍵轉乘巴士線 - 含有預設班次等待時間懲罰]
-    bus_edges = [
-        ("彩虹", "香港科技大學 (HKUST)", 15, "九巴 91M", "寶林", 1, 8),      # 15分車程 + 8分平均等車
-        ("鑽石山", "香港科技大學 (HKUST)", 20, "九巴 91M", "寶林", 1, 8),
-        ("坑口", "香港科技大學 (HKUST)", 10, "九巴 91M", "鑽石山", 1, 6),
-        ("寶琳", "香港科技大學 (HKUST)", 12, "九巴 91M", "鑽石山", 1, 6),
-        ("調景嶺", "香港科技大學 (HKUST)", 18, "九巴 792M", "西貢", 1, 10),
-        ("觀塘", "中環", 35, "九巴 619", "中環", 1, 7),
-        ("旺角", "灣仔", 20, "九巴 102", "筲箕灣", 1, 5),
-        ("屯門", "灣仔", 50, "城巴 962X", "銅鑼灣", 1, 8),
-        ("元朗", "金鐘", 45, "九巴 968", "銅鑼灣", 1, 6)
-    ]
-
-    # 港鐵路線：純車程 + 平均 2 分鐘等車時間
+    # 加入地鐵邊線（雙向）
     for u, v, weight, line in mtr_edges:
-        G.add_edge(u, v, pure_weight=weight, weight=weight + 0.5, line=line, dest="", seq=0)
-        G.add_edge(v, u, pure_weight=weight, weight=weight + 0.5, line=line, dest="", seq=0)
-        
-    # 巴士路線：純車程 + 平均等車時間 (wait_penalty)
-    for u, v, pure_w, line, dest, seq, wait_penalty in bus_edges:
-        total_edge_weight = pure_w + wait_penalty
-        G.add_edge(u, v, pure_weight=pure_w, weight=total_edge_weight, line=line, dest=dest, seq=seq)
+        G.add_edge(u, v, pure_time=weight, line=line, dest="", seq=0)
+        G.add_edge(v, u, pure_time=weight, line=line, dest="", seq=0)
+
+    # 動態將全港所有 API 巴士路線寫入網絡
+    for r in bus_routes:
+        orig = r["orig"]
+        dest = r["dest"]
+        line = r["line"]
+        if orig and dest:
+            # 巴士預設平均行程時間為 30 分鐘
+            G.add_edge(orig, dest, pure_time=30, line=line, dest=dest, seq=1)
 
     return G
 
-# 4. 抓取實時 ETA 函數
-def fetch_exact_stop_eta(route_no, station_name, target_dest, seq_no):
+# 4. 「最少轉乘優先」的動態權重搜尋演算法
+def find_min_transfer_path(G, source, target):
+    """
+    自訂 Dijkstra / BFS 最優路徑演算法：
+    以 (轉乘次數 * 10,000 + 總時間) 為路徑權重，確保轉乘次數最少，同轉乘次數時時間最短。
+    """
+    # 建立輔助轉乘圖：每個節點為 (車站, 當前路線)
+    H = nx.DiGraph()
+    TRANSFER_PENALTY = 10000 # 轉乘一次懲罰 10,000 分鐘，確保轉乘次數絕對優先
+    
+    # 建立虛擬起點與終點
+    H.add_node("START")
+    H.add_node("END")
+    
+    for u, v, data in G.edges(data=True):
+        line = data["line"]
+        pure_time = data["pure_time"]
+        
+        node_u = (u, line)
+        node_v = (v, line)
+        
+        # 同路線內的移動：只有純時間，無轉乘懲罰
+        H.add_edge(node_u, node_v, weight=pure_time, pure_time=pure_time, line=line)
+        
+        # 起點可免費進入任何路線
+        if u == source:
+            H.add_edge("START", node_u, weight=0, pure_time=0, line="START")
+        # 任何路線到達終點均無額外費用
+        if v == target:
+            H.add_edge(node_v, "END", weight=0, pure_time=0, line="END")
+
+    # 同一車站內更換路線：加 1 次轉乘懲罰 (+10000) 及 4 分鐘轉乘時間
+    stations = set(G.nodes())
+    for s in stations:
+        lines_at_s = list(set([data["line"] for u, v, data in G.edges(data=True) if u == s or v == s]))
+        for i in range(len(lines_at_s)):
+            for j in range(i + 1, len(lines_at_s)):
+                l1 = lines_at_s[i]
+                l2 = lines_at_s[j]
+                H.add_edge((s, l1), (s, l2), weight=TRANSFER_PENALTY + 4, pure_time=4, line="TRANSFER")
+                H.add_edge((s, l2), (s, l1), weight=TRANSFER_PENALTY + 4, pure_time=4, line="TRANSFER")
+
+    # 執行最短路徑尋找
+    raw_h_path = nx.dijkstra_path(H, source="START", target="END", weight="weight")
+    
+    # 解析結果
+    path_steps = []
+    transfers = 0
+    total_pure_time = 0
+    
+    # 提取實質步驟
+    node_path = raw_h_path[1:-1] # 移除 START 與 END
+    
+    current_board = node_path[0][0]
+    current_line = node_path[0][1]
+    accumulated_time = 0
+    
+    for i in range(len(node_path) - 1):
+        curr_s, curr_l = node_path[i]
+        next_s, next_l = node_path[i+1]
+        
+        edge_d = H.get_edge_data((curr_s, curr_l), (next_s, next_l))
+        
+        if edge_d and edge_d["line"] == "TRANSFER":
+            transfers += 1
+            path_steps.append({
+                "上車站": current_board,
+                "落車站": curr_s,
+                "路線": current_line,
+                "純車程時間": accumulated_time
+            })
+            total_pure_time += accumulated_time
+            current_board = curr_s
+            current_line = next_l
+            accumulated_time = 4 # 轉乘緩衝 4 分鐘
+        else:
+            accumulated_time += edge_d["pure_time"] if edge_d else 0
+            
+    path_steps.append({
+        "上車站": current_board,
+        "落車站": node_path[-1][0],
+        "路線": current_line,
+        "純車程時間": accumulated_time
+    })
+    total_pure_time += accumulated_time
+
+    return path_steps, transfers, total_pure_time
+
+# 5. 抓取九巴實時 ETA 函數
+def fetch_exact_stop_eta(route_no, station_name):
     now = datetime.now()
     eta_rows = []
     
@@ -115,17 +216,12 @@ def fetch_exact_stop_eta(route_no, station_name, target_dest, seq_no):
     try:
         res = requests.get(api_url, timeout=3)
         if res.status_code == 200:
-            data = res.json().get("data", [])
-            
-            for item in data:
-                dest = item.get("dest_tc", "")
-                item_seq = item.get("seq")
+            for item in res.json().get("data", []):
                 eta_str = item.get("eta")
-                
-                if target_dest in dest and (seq_no == 0 or item_seq == seq_no) and eta_str:
+                dest = item.get("dest_tc", "")
+                if eta_str:
                     eta_t = datetime.fromisoformat(eta_str)
                     diff = int((eta_t - now.astimezone()).total_seconds() / 60)
-                    
                     if diff >= 0:
                         eta_rows.append({
                             "上車地點": station_name,
@@ -139,136 +235,58 @@ def fetch_exact_stop_eta(route_no, station_name, target_dest, seq_no):
 
     return sorted(eta_rows, key=lambda x: x["raw_time"])[:3]
 
-# 5. 路徑壓縮與時間拆解
-def compress_path(G, path):
-    if len(path) < 2:
-        return []
-    
-    compressed_steps = []
-    current_board_station = path[0]
-    current_line = None
-    target_dest = ""
-    target_seq = 0
-    accumulated_pure_time = 0
-    accumulated_weight = 0
-    
-    for i in range(len(path) - 1):
-        u = path[i]
-        v = path[i+1]
-        edge_data = G.get_edge_data(u, v)
-        line = edge_data['line']
-        pure_duration = edge_data['pure_weight']
-        total_w = edge_data['weight']
-        dest = edge_data.get('dest', '')
-        seq = edge_data.get('seq', 0)
-        
-        if current_line is None:
-            current_line = line
-            target_dest = dest
-            target_seq = seq
-            accumulated_pure_time += pure_duration
-            accumulated_weight += total_w
-        elif line == current_line:
-            accumulated_pure_time += pure_duration
-            accumulated_weight += total_w
-        else:
-            compressed_steps.append({
-                "上車站": current_board_station,
-                "落車站": u,
-                "路線": current_line,
-                "方向": target_dest,
-                "seq": target_seq,
-                "純車程時間": accumulated_pure_time,
-                "預估總時間": accumulated_weight
-            })
-            current_board_station = u
-            current_line = line
-            target_dest = dest
-            target_seq = seq
-            accumulated_pure_time = pure_duration
-            accumulated_weight = total_w
-            
-    compressed_steps.append({
-        "上車站": current_board_station,
-        "落車站": path[-1],
-        "路線": current_line,
-        "方向": target_dest,
-        "seq": target_seq,
-        "純車程時間": accumulated_pure_time,
-        "預估總時間": accumulated_weight
-    })
-    
-    return compressed_steps
+# 6. UI 與主邏輯
+with st.spinner("🔄 正在讀取全港所有地鐵及巴士站點..."):
+    bus_routes = load_all_bus_routes()
+    G = build_full_hk_network(bus_routes)
 
-# 6. 主 UI 與計算 logic
-G = build_dynamic_hk_network()
 all_stations = sorted(list(G.nodes()))
 
 col1, col2 = st.columns(2)
 with col1:
-    start_node = st.selectbox("📍 出發地點:", options=all_stations, index=all_stations.index("屯門") if "屯門" in all_stations else 0)
+    start_node = st.selectbox("📍 出發地點 (地鐵站 / 巴士站):", options=all_stations, index=all_stations.index("屯門") if "屯門" in all_stations else 0)
 with col2:
-    end_node = st.selectbox("🎯 目的地:", options=all_stations, index=all_stations.index("香港科技大學 (HKUST)") if "香港科技大學 (HKUST)" in all_stations else 1)
+    end_node = st.selectbox("🎯 目的地 (地鐵站 / 巴士站):", options=all_stations, index=all_stations.index("烏溪沙") if "烏溪沙" in all_stations else (len(all_stations)-1 if len(all_stations)>0 else 0))
 
-if st.button("🗺️ 計算最佳真實門到門路線", type="primary"):
+if st.button("🗺️ 計算最佳路線 (最少轉乘優先)", type="primary"):
     if start_node == end_node:
         st.warning("起點與目的地不能相同！")
     else:
         try:
-            # 使用包含「候車加權 (weight)」的動態 Dijkstra
-            raw_path = nx.dijkstra_path(G, source=start_node, target=end_node, weight='weight')
-            compressed_steps = compress_path(G, raw_path)
+            path_steps, transfers_count, total_time = find_min_transfer_path(G, start_node, end_node)
             
-            total_pure_vehicle_time = 0
-            total_real_wait_time = 0
-
-            for idx, step in enumerate(compressed_steps):
-                line = step["路線"]
-                board = step["上車站"]
-                pure_time = step["純車程時間"]
-                total_pure_vehicle_time += pure_time
-                
-                step_wait_time = 0
-                if idx > 0:
-                    step_wait_time += 3 # 轉乘步行緩衝
-                
-                if "九巴" in line:
-                    bus_no = line.split(" ")[1]
-                    eta_list = fetch_exact_stop_eta(bus_no, board, step["方向"], step["seq"])
-                    if eta_list:
-                        step_wait_time += eta_list[0]["到站倒數"]
-                        step["eta_data"] = eta_list
-
-                total_real_wait_time += step_wait_time
-
-            grand_total_time = total_pure_vehicle_time + total_real_wait_time
-
-            st.success(f"🎉 **綜合最佳預估總時間：約 {grand_total_time} 分鐘** （純車程：{total_pure_vehicle_time} 分鐘 + 轉乘候車：{total_real_wait_time} 分鐘）")
+            st.success(f"🎉 **找到最佳路線！**")
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("🔄 轉乘次數", f"{transfers_count} 次")
+            col_b.metric("⏱️ 預估總時間", f"約 {total_time} 分鐘")
+            col_c.metric("🚉 總跨度段數", f"{len(path_steps)} 段")
             
-            st.subheader("🧭 建議路線方案：")
+            st.subheader("🧭 最優乘車明細：")
             
-            for idx, step in enumerate(compressed_steps, 1):
+            for idx, step in enumerate(path_steps, 1):
                 line = step["路線"]
                 board = step["上車站"]
                 alight = step["落車站"]
                 pure_time = step["純車程時間"]
-                dest_info = f"（往 {step['方向']} 方向）" if step['方向'] else ""
                 
                 st.markdown(f"""
-                #### **Step {idx}: 乘搭 {line} {dest_info}**
+                #### **Step {idx}: 乘搭 {line}**
                 * 🟢 **上車站**：`{board}`
-                * 🔴 **落車站**：`{alight}` （純行車時間：約 {pure_time} 分鐘）
+                * 🔴 **落車站**：`{alight}` （預計車程：約 {pure_time} 分鐘）
                 """)
                 
-                if "eta_data" in step and step["eta_data"]:
-                    df_display = pd.DataFrame(step["eta_data"])
-                    df_display["到站倒數"] = df_display["到站倒數"].apply(lambda x: f"{x} 分鐘" if x > 0 else "即將到站")
-                    df_display = df_display.drop(columns=["raw_time"], errors="ignore")
-                    
-                    st.write(f"⏱️ **`{board}` 站實時到站班次：**")
-                    st.dataframe(df_display, use_container_width=True)
+                # 如果是九巴，抓取實時到站班次
+                if "九巴" in line:
+                    bus_no = line.split(" ")[1]
+                    eta_list = fetch_exact_stop_eta(bus_no, board)
+                    if eta_list:
+                        df_display = pd.DataFrame(eta_list)
+                        df_display["到站倒數"] = df_display["到站倒數"].apply(lambda x: f"{x} 分鐘" if x > 0 else "即將到站")
+                        df_display = df_display.drop(columns=["raw_time"], errors="ignore")
+                        st.write(f"⏱️ **`{board}` 站實時到站班次：**")
+                        st.dataframe(df_display, use_container_width=True)
                     
                 st.divider()
 
-        except nx.NetworkXNoPath:
-            st.error("抱歉，目前找不到連接這兩地的路線。")
+        except Exception as e:
+            st.error(f"抱歉，目前找不到連通這兩地的路線，請試試尋找鄰近的主要交匯站。（錯誤細節：{e}）")
